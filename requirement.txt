@@ -1,0 +1,6 @@
+streamlit
+numpy
+PyPDF2
+python-docx
+openai
+tencentcloud-sdk-python
