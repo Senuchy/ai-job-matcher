@@ -13,54 +13,224 @@ from tencentcloud.hunyuan.v20230901 import hunyuan_client, models
 from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+import hashlib
 
 # --- 页面配置 ---
-st.set_page_config(page_title="ai-matcher-assistant", layout="wide")
+st.set_page_config(page_title="简历岗位匹配评分ai助手", layout="wide")
 
 # --- 初始化 Session State ---
 if "page" not in st.session_state:
-    st.session_state.page = "match"  # 'match', 'job_lib', 'resume_lib', 'job_to_candidates'
+    st.session_state.page = "match"
 if "selected_job_for_match" not in st.session_state:
     st.session_state.selected_job_for_match = None
 
-# --- 初始化腾讯云 Embedding 客户端 ---
-def get_embedding(text):
+
+# ============================================================
+#  缓存层：全局资源（@st.cache_resource）
+# ============================================================
+
+@st.cache_resource
+def init_db():
+    """数据库连接 + 表结构迁移，只执行一次"""
+    conn = sqlite3.connect('hunter.db', check_same_thread=False)
+    c = conn.cursor()
+
+    # 岗位表
+    c.execute('''CREATE TABLE IF NOT EXISTS jobs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  title TEXT,
+                  jd_text TEXT,
+                  embedding TEXT)''')
+    c.execute("PRAGMA table_info(jobs)")
+    existing_job_cols = [col[1] for col in c.fetchall()]
+    job_fields = {
+        "company_name": "TEXT",
+        "platform": "TEXT",
+        "department": "TEXT",
+        "location": "TEXT",
+        "core_business": "TEXT",
+        "candidate_profile": "TEXT"
+    }
+    for field, dtype in job_fields.items():
+        if field not in existing_job_cols:
+            c.execute(f"ALTER TABLE jobs ADD COLUMN {field} {dtype}")
+
+    # 简历表
+    c.execute('''CREATE TABLE IF NOT EXISTS resumes
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  name TEXT,
+                  text TEXT,
+                  embedding TEXT)''')
+    c.execute("PRAGMA table_info(resumes)")
+    existing_resume_cols = [col[1] for col in c.fetchall()]
+    resume_fields = {
+        "phone": "TEXT",
+        "email": "TEXT",
+        "education": "TEXT"
+    }
+    for field, dtype in resume_fields.items():
+        if field not in existing_resume_cols:
+            c.execute(f"ALTER TABLE resumes ADD COLUMN {field} {dtype}")
+
+    conn.commit()
+    return conn
+
+
+@st.cache_resource
+def get_tencent_embedding_client():
+    """腾讯云 Embedding 客户端，只创建一次"""
     secret_id = os.environ.get("TENCENT_SECRET_ID")
     secret_key = os.environ.get("TENCENT_SECRET_KEY")
     if not secret_id or not secret_key:
-        st.error("请设置环境变量 TENCENT_SECRET_ID 和 TENCENT_SECRET_KEY")
-        st.stop()
+        return None
     cred = credential.Credential(secret_id, secret_key)
     httpProfile = HttpProfile()
     httpProfile.endpoint = "hunyuan.tencentcloudapi.com"
     clientProfile = ClientProfile()
     clientProfile.httpProfile = httpProfile
-    client = hunyuan_client.HunyuanClient(cred, "", clientProfile)
-    req = models.GetEmbeddingRequest()
-    truncated_text = text[:1024]
-    req.Input = truncated_text
-    resp = client.GetEmbedding(req)
-    embedding = resp.Data[0].Embedding
-    return embedding
+    return hunyuan_client.HunyuanClient(cred, "", clientProfile)
 
-# --- 初始化 TokenHub 客户端（AI 评分）---
-tokenhub_api_key = os.environ.get("TOKENHUB_API_KEY")
-if tokenhub_api_key:
-    chat_client = OpenAI(
+
+@st.cache_resource
+def get_chat_client():
+    """TokenHub Chat 客户端，只创建一次"""
+    tokenhub_api_key = os.environ.get("TOKENHUB_API_KEY")
+    if not tokenhub_api_key:
+        return None
+    return OpenAI(
         api_key=tokenhub_api_key,
         base_url="https://tokenhub.tencentmaas.com/v1",
         timeout=15.0
     )
-else:
-    chat_client = None
 
-# --- 余弦相似度 ---
+
+# 初始化全局资源（缓存后不会重复执行）
+conn = init_db()
+c = conn.cursor()
+chat_client = get_chat_client()
+
+
+# ============================================================
+#  缓存层：数据查询（@st.cache_data）
+# ============================================================
+
+def _make_cache_key(*args):
+    """将任意参数转为可哈希的 key"""
+    return hashlib.md5(json.dumps(args, default=str).encode()).hexdigest()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_jobs(filter_company="", filter_platform="", filter_location=""):
+    """获取岗位列表（带筛选），缓存 5 分钟"""
+    query = "SELECT id, title, company_name, platform, location, jd_text FROM jobs WHERE 1=1"
+    params = []
+    if filter_company:
+        query += " AND company_name LIKE ?"
+        params.append(f"%{filter_company}%")
+    if filter_platform:
+        query += " AND platform LIKE ?"
+        params.append(f"%{filter_platform}%")
+    if filter_location:
+        query += " AND location LIKE ?"
+        params.append(f"%{filter_location}%")
+    query += " ORDER BY id DESC"
+    return c.execute(query, params).fetchall()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_resumes(filter_name="", filter_phone="", filter_email=""):
+    """获取简历列表（带筛选），缓存 5 分钟"""
+    query = "SELECT id, name, phone, email, education, text FROM resumes WHERE 1=1"
+    params = []
+    if filter_name:
+        query += " AND name LIKE ?"
+        params.append(f"%{filter_name}%")
+    if filter_phone:
+        query += " AND phone LIKE ?"
+        params.append(f"%{filter_phone}%")
+    if filter_email:
+        query += " AND email LIKE ?"
+        params.append(f"%{filter_email}%")
+    query += " ORDER BY id DESC"
+    return c.execute(query, params).fetchall()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_all_resumes_for_match():
+    """简历匹配页面用：获取全部简历（id, name, text），缓存 1 小时"""
+    return c.execute("SELECT id, name, text FROM resumes ORDER BY id DESC").fetchall()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_resume_count():
+    """简历总数，缓存 5 分钟"""
+    return c.execute("SELECT COUNT(*) FROM resumes").fetchone()[0]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_job_by_id(job_id):
+    """按 ID 获取岗位，缓存 1 小时"""
+    return c.execute("SELECT title, jd_text, embedding FROM jobs WHERE id=?", (job_id,)).fetchone()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_job_extra(job_id):
+    """获取岗位附加信息，缓存 1 小时"""
+    return c.execute("SELECT department, core_business, candidate_profile FROM jobs WHERE id=?", (job_id,)).fetchone()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_all_jobs_for_match():
+    """匹配页面用：获取全部岗位（含 embedding），缓存 1 小时"""
+    return c.execute("SELECT id, title, jd_text, embedding FROM jobs").fetchall()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_all_resumes_for_reverse_match():
+    """反向匹配用：获取全部简历（含 embedding），缓存 1 小时"""
+    return c.execute("SELECT id, name, text, embedding, phone, email, education FROM resumes").fetchall()
+
+
+@st.cache_data(ttl=3600, show_spinner="生成向量中...")
+def get_embedding(text):
+    """获取文本 embedding，相同文本直接返回缓存结果"""
+    client = get_tencent_embedding_client()
+    if client is None:
+        st.error("请设置环境变量 TENCENT_SECRET_ID 和 TENCENT_SECRET_KEY")
+        st.stop()
+    req = models.GetEmbeddingRequest()
+    req.Input = text[:1024]
+    resp = client.GetEmbedding(req)
+    return resp.Data[0].Embedding
+
+
+def invalidate_jobs_cache():
+    """写入岗位后清除相关缓存"""
+    get_all_jobs.clear()
+    get_all_jobs_for_match.clear()
+    get_job_by_id.clear()
+    get_job_extra.clear()
+    get_resume_count.clear()  # 不影响，但保险起见
+
+
+def invalidate_resumes_cache():
+    """写入简历后清除相关缓存"""
+    get_all_resumes.clear()
+    get_all_resumes_for_match.clear()
+    get_all_resumes_for_reverse_match.clear()
+    get_resume_count.clear()
+
+
+# ============================================================
+#  工具函数
+# ============================================================
+
 def cosine_similarity(a, b):
     a = np.array(a)
     b = np.array(b)
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-# --- 解析简历文件（用于匹配页面）---
+
 def extract_text_from_file(uploaded_file):
     text = ""
     if uploaded_file.type == "application/pdf":
@@ -73,7 +243,7 @@ def extract_text_from_file(uploaded_file):
             text += para.text
     return text
 
-# --- 智能文本截断 ---
+
 def smart_truncate(text, max_len=3000):
     if len(text) <= max_len:
         return text
@@ -81,8 +251,9 @@ def smart_truncate(text, max_len=3000):
     tail_len = max_len - head_len
     return text[:head_len] + "\n...(中间内容省略)...\n" + text[-tail_len:]
 
-# --- AI 评分函数（简历 -> 岗位）---
+
 def evaluate_match_with_ai(job_title, jd_text, resume_text):
+    """AI 评分函数（简历 <-> 岗位）"""
     if not chat_client:
         return None, "未配置 AI 评分服务", ""
     jd_preview = smart_truncate(jd_text, 3200)
@@ -164,70 +335,32 @@ def evaluate_match_with_ai(job_title, jd_text, resume_text):
     except Exception as e:
         return None, f"调用失败：{str(e)}", ""
 
-# --- SQLite 初始化（含字段扩展与迁移）---
-conn = sqlite3.connect('hunter.db', check_same_thread=False)
-c = conn.cursor()
 
-# 岗位表
-c.execute('''CREATE TABLE IF NOT EXISTS jobs
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              title TEXT,
-              jd_text TEXT,
-              embedding TEXT)''')
-c.execute("PRAGMA table_info(jobs)")
-existing_job_cols = [col[1] for col in c.fetchall()]
-job_fields = {
-    "company_name": "TEXT",
-    "platform": "TEXT",
-    "department": "TEXT",
-    "location": "TEXT",
-    "core_business": "TEXT",
-    "candidate_profile": "TEXT"
-}
-for field, dtype in job_fields.items():
-    if field not in existing_job_cols:
-        c.execute(f"ALTER TABLE jobs ADD COLUMN {field} {dtype}")
+# ============================================================
+#  侧边栏导航
+# ============================================================
 
-# 简历表
-c.execute('''CREATE TABLE IF NOT EXISTS resumes
-             (id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT,
-              text TEXT,
-              embedding TEXT)''')
-c.execute("PRAGMA table_info(resumes)")
-existing_resume_cols = [col[1] for col in c.fetchall()]
-resume_fields = {
-    "phone": "TEXT",
-    "email": "TEXT",
-    "education": "TEXT"
-}
-for field, dtype in resume_fields.items():
-    if field not in existing_resume_cols:
-        c.execute(f"ALTER TABLE resumes ADD COLUMN {field} {dtype}")
-
-conn.commit()
-
-# --- 侧边栏导航 ---
 with st.sidebar:
-    st.title("🤝 AI匹配助手（严格评分版）")
+    st.title("🤝 简历岗位匹配评分AI助手")
     st.divider()
     if st.button("📄 简历匹配岗位", use_container_width=True):
         st.session_state.page = "match"
         st.session_state.selected_job_for_match = None
-        st.rerun()
     if st.button("📁 岗位库管理", use_container_width=True):
         st.session_state.page = "job_lib"
-        st.rerun()
     if st.button("📇 简历库管理", use_container_width=True):
         st.session_state.page = "resume_lib"
-        st.rerun()
+    if st.button("🔄 岗位匹配候选人", use_container_width=True):
+        st.session_state.page = "job_to_candidates"
     st.divider()
     if not chat_client:
         st.warning("未设置 TOKENHUB_API_KEY，AI评分不可用。")
 
-# --- 页面渲染 ---
 
-# ---------- 简历匹配岗位页面（原有逻辑）----------
+# ============================================================
+#  页面：简历匹配岗位
+# ============================================================
+
 if st.session_state.page == "match":
     st.title("📄 简历智能匹配岗位")
     input_mode = st.radio(
@@ -252,7 +385,7 @@ if st.session_state.page == "match":
         if resume_text:
             resume_text = resume_text.strip()
     else:  # 从简历库选择
-        resumes = c.execute("SELECT id, name, text FROM resumes ORDER BY id DESC").fetchall()
+        resumes = get_all_resumes_for_match()
         if not resumes:
             st.warning("简历库暂无简历，请先录入")
             st.stop()
@@ -263,16 +396,14 @@ if st.session_state.page == "match":
 
     if resume_text:
         st.success("简历内容已就绪！")
-        # 显示简历预览（可选）
         with st.expander("📄 简历内容预览"):
             st.text(resume_text[:500] + ("..." if len(resume_text) > 500 else ""))
 
-        # 匹配按钮
         if st.button("🔍 开始匹配岗位", type="primary", use_container_width=True):
             with st.spinner("生成简历向量..."):
                 resume_embedding = get_embedding(resume_text)
 
-            jobs = c.execute("SELECT id, title, jd_text, embedding FROM jobs").fetchall()
+            jobs = get_all_jobs_for_match()
             if not jobs:
                 st.warning("暂无岗位，请先在岗位库中添加")
                 st.stop()
@@ -289,6 +420,7 @@ if st.session_state.page == "match":
             if chat_client:
                 st.info("🤖 AI 正在严格评估匹配度，请稍候...")
                 top3_candidates = top_candidates[:3]
+
                 def ai_score_job(job_tuple):
                     job_id, title, jd_text, sim = job_tuple
                     score, reason, dimensions = evaluate_match_with_ai(title, jd_text, resume_text)
@@ -297,6 +429,7 @@ if st.session_state.page == "match":
                         return (title, jd_text, fallback_score, f"AI调用失败，回退分数 ({reason})", sim, "")
                     else:
                         return (title, jd_text, score, reason, sim, dimensions)
+
                 ai_results = []
                 start_time = time.time()
                 with ThreadPoolExecutor(max_workers=3) as executor:
@@ -339,11 +472,15 @@ if st.session_state.page == "match":
                 for job_id, title, jd_text, sim in top_candidates[:3]:
                     with st.expander(f"**{title}** 相似度：{sim:.2%}"):
                         st.write(f"**职位描述摘要：** {jd_text[:300]}...")
-# ---------- 岗位库管理页面 ----------
+
+
+# ============================================================
+#  页面：岗位库管理
+# ============================================================
+
 elif st.session_state.page == "job_lib":
     st.title("📁 岗位库管理")
 
-    # 筛选区域
     with st.container():
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -385,6 +522,7 @@ elif st.session_state.page == "job_lib":
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (title, jd_text, json.dumps(embedding), company, platform, department, location, core_business, candidate_profile))
                             conn.commit()
+                        invalidate_jobs_cache()
                         st.success("岗位已保存！")
                         st.rerun()
 
@@ -429,33 +567,20 @@ elif st.session_state.page == "job_lib":
                                     st.warning(f"第{i+2}行导入失败: {e}")
                                 progress_bar.progress((i+1)/total)
                             conn.commit()
+                            invalidate_jobs_cache()
                             st.success(f"成功导入 {success_count} 条岗位")
                             st.rerun()
                 except Exception as e:
                     st.error(f"读取Excel失败: {e}")
 
-    # 查询并显示岗位列表（带筛选）
-    query = "SELECT id, title, company_name, platform, location, jd_text FROM jobs WHERE 1=1"
-    params = []
-    if filter_company:
-        query += " AND company_name LIKE ?"
-        params.append(f"%{filter_company}%")
-    if filter_platform:
-        query += " AND platform LIKE ?"
-        params.append(f"%{filter_platform}%")
-    if filter_location:
-        query += " AND location LIKE ?"
-        params.append(f"%{filter_location}%")
-    query += " ORDER BY id DESC"
-
-    jobs_data = c.execute(query, params).fetchall()
+    # 查询并显示岗位列表（使用缓存）
+    jobs_data = get_all_jobs(filter_company, filter_platform, filter_location)
 
     if not jobs_data:
         st.info("暂无岗位，请先导入")
     else:
         st.subheader(f"📋 岗位列表（共 {len(jobs_data)} 个）")
 
-        # 多选删除
         job_options = {
             f"{job[2] or '未知公司'} - {job[1]} ({job[4] or '地点未填'}) [ID:{job[0]}]": job[0]
             for job in jobs_data
@@ -470,11 +595,11 @@ elif st.session_state.page == "job_lib":
                 ids_to_delete = [job_options[label] for label in selected_labels]
                 c.executemany("DELETE FROM jobs WHERE id = ?", [(i,) for i in ids_to_delete])
                 conn.commit()
+                invalidate_jobs_cache()
                 st.success(f"已删除 {len(ids_to_delete)} 个岗位")
                 st.rerun()
 
         st.divider()
-        # 预览卡片
         for job in jobs_data:
             job_id, title, company, platform, location, jd_text = job
             company_display = company if company else "（未填公司）"
@@ -491,20 +616,26 @@ elif st.session_state.page == "job_lib":
                         st.rerun()
                 st.markdown("**📄 岗位JD：**")
                 st.text_area("JD详情", jd_text, height=200, key=f"jd_{job_id}", label_visibility="collapsed")
-                extra = c.execute("SELECT department, core_business, candidate_profile FROM jobs WHERE id=?", (job_id,)).fetchone()
+                extra = get_job_extra(job_id)
                 if extra:
                     dept, core_biz, profile = extra
                     if dept or core_biz or profile:
                         st.markdown("**📌 附加信息：**")
-                        if dept: st.caption(f"部门：{dept}")
-                        if core_biz: st.caption(f"核心业务：{core_biz}")
-                        if profile: st.caption(f"人选画像：{profile}")
+                        if dept:
+                            st.caption(f"部门：{dept}")
+                        if core_biz:
+                            st.caption(f"核心业务：{core_biz}")
+                        if profile:
+                            st.caption(f"人选画像：{profile}")
 
-# ---------- 简历库管理页面 ----------
+
+# ============================================================
+#  页面：简历库管理
+# ============================================================
+
 elif st.session_state.page == "resume_lib":
     st.title("📇 简历库管理")
 
-    # 筛选区域
     with st.container():
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -516,7 +647,6 @@ elif st.session_state.page == "resume_lib":
 
     st.divider()
 
-    # 导入区域
     with st.expander("➕ 导入新简历", expanded=False):
         tab1, tab2 = st.tabs(["📝 手动录入", "📊 Excel批量导入"])
 
@@ -529,20 +659,21 @@ elif st.session_state.page == "resume_lib":
                     email = st.text_input("邮箱")
                 with col_b:
                     education = st.text_input("学历背景（学校+专业+毕业年份）")
-                resume_text = st.text_area("简历正文（详细工作经历、技能等）", height=250)
+                resume_text_input = st.text_area("简历正文（详细工作经历、技能等）", height=250)
                 submitted = st.form_submit_button("保存简历")
                 if submitted:
-                    if not name or not resume_text:
+                    if not name or not resume_text_input:
                         st.error("姓名和简历正文为必填项")
                     else:
                         with st.spinner("生成向量中..."):
-                            embedding = get_embedding(resume_text)
+                            embedding = get_embedding(resume_text_input)
                             c.execute("""
                                 INSERT INTO resumes 
                                 (name, text, embedding, phone, email, education)
                                 VALUES (?, ?, ?, ?, ?, ?)
-                            """, (name, resume_text, json.dumps(embedding), phone, email, education))
+                            """, (name, resume_text_input, json.dumps(embedding), phone, email, education))
                             conn.commit()
+                        invalidate_resumes_cache()
                         st.success("简历已保存！")
                         st.rerun()
 
@@ -584,35 +715,22 @@ elif st.session_state.page == "resume_lib":
                                     st.warning(f"第{i+2}行导入失败: {e}")
                                 progress_bar.progress((i+1)/total)
                             conn.commit()
+                            invalidate_resumes_cache()
                             st.success(f"成功导入 {success_count} 条简历")
                             st.rerun()
                 except Exception as e:
                     st.error(f"读取Excel失败: {e}")
 
-    # 查询并显示简历列表
-    query = "SELECT id, name, phone, email, education, text FROM resumes WHERE 1=1"
-    params = []
-    if filter_name:
-        query += " AND name LIKE ?"
-        params.append(f"%{filter_name}%")
-    if filter_phone:
-        query += " AND phone LIKE ?"
-        params.append(f"%{filter_phone}%")
-    if filter_email:
-        query += " AND email LIKE ?"
-        params.append(f"%{filter_email}%")
-    query += " ORDER BY id DESC"
-
-    resumes_data = c.execute(query, params).fetchall()
+    # 查询并显示简历列表（使用缓存）
+    resumes_data = get_all_resumes(filter_name, filter_phone, filter_email)
 
     if not resumes_data:
         st.info("暂无简历，请先导入")
     else:
         st.subheader(f"📋 简历列表（共 {len(resumes_data)} 个）")
 
-        # 多选删除
         resume_options = {
-            f"{r[1]} - {r[3] or '无电话'} - {r[4] or '无邮箱'} [ID:{r[0]}]": r[0]
+            f"{r[1]} - {r[2] or '无电话'} - {r[3] or '无邮箱'} [ID:{r[0]}]": r[0]
             for r in resumes_data
         }
         selected_labels = st.multiselect(
@@ -625,11 +743,11 @@ elif st.session_state.page == "resume_lib":
                 ids_to_delete = [resume_options[label] for label in selected_labels]
                 c.executemany("DELETE FROM resumes WHERE id = ?", [(i,) for i in ids_to_delete])
                 conn.commit()
+                invalidate_resumes_cache()
                 st.success(f"已删除 {len(ids_to_delete)} 条简历")
                 st.rerun()
 
         st.divider()
-        # 预览卡片
         for r in resumes_data:
             resume_id, name, phone, email, education, text = r
             with st.expander(f"👤 {name} — 📞 {phone or '未填'} — ✉️ {email or '未填'}"):
@@ -639,14 +757,18 @@ elif st.session_state.page == "resume_lib":
                 st.markdown("**📄 简历正文：**")
                 st.text_area("简历详情", text, height=200, key=f"resume_{resume_id}", label_visibility="collapsed")
 
-# ---------- 岗位匹配候选人页面（反向匹配）----------
+
+# ============================================================
+#  页面：岗位匹配候选人（反向匹配）
+# ============================================================
+
 elif st.session_state.page == "job_to_candidates":
     job_id = st.session_state.selected_job_for_match
     if not job_id:
         st.error("未选择岗位，请返回岗位库")
         st.stop()
 
-    job = c.execute("SELECT title, jd_text, embedding FROM jobs WHERE id=?", (job_id,)).fetchone()
+    job = get_job_by_id(job_id)
     if not job:
         st.error("岗位不存在")
         st.stop()
@@ -659,15 +781,12 @@ elif st.session_state.page == "job_to_candidates":
     with st.expander("📄 岗位JD详情"):
         st.text(jd_text)
 
-    # 检查简历库是否为空
-    resumes_count = c.execute("SELECT COUNT(*) FROM resumes").fetchone()[0]
-    if resumes_count == 0:
+    if get_resume_count() == 0:
         st.warning("简历库暂无简历，请先录入")
         st.stop()
 
-    # 匹配按钮
     if st.button("🔍 开始匹配候选人", type="primary", use_container_width=True):
-        resumes = c.execute("SELECT id, name, text, embedding, phone, email, education FROM resumes").fetchall()
+        resumes = get_all_resumes_for_reverse_match()
 
         with st.spinner("正在计算向量相似度..."):
             results = []
@@ -682,6 +801,7 @@ elif st.session_state.page == "job_to_candidates":
 
         if chat_client:
             st.info("🤖 AI 正在严格评估候选人匹配度，请稍候...")
+
             def ai_score_candidate(cand):
                 cid, name, text, sim, phone, email, edu = cand
                 score, reason, dimensions = evaluate_match_with_ai(job_title, jd_text, text)
@@ -694,7 +814,7 @@ elif st.session_state.page == "job_to_candidates":
             ai_results = []
             start_time = time.time()
             with ThreadPoolExecutor(max_workers=3) as executor:
-                future_to_cand = {executor.submit(ai_score_candidate, c): c for c in top3}
+                future_to_cand = {executor.submit(ai_score_candidate, cc): cc for cc in top3}
                 progress_bar = st.progress(0)
                 completed = 0
                 total = len(future_to_cand)
@@ -745,4 +865,4 @@ elif st.session_state.page == "job_to_candidates":
     if st.button("🔙 返回岗位库"):
         st.session_state.page = "job_lib"
         st.session_state.selected_job_for_match = None
-        st.rerun()
+        # 不需要 st.rerun() — 按钮点击已触发 rerun
